@@ -18,6 +18,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/requests"
 	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/directory/v1"
+	"google.golang.org/api/cloudidentity/v1"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -196,6 +197,25 @@ func (p *GoogleProvider) EnrichSession(_ context.Context, s *sessions.SessionSta
 //
 // TODO (@NickMeves) - Unit Test this OR refactor away from groupValidator func
 func (p *GoogleProvider) SetGroupRestriction(groups []string, adminEmail string, credentialsReader io.Reader) {
+	if adminEmail == "" {
+		cloudIdentityService := getCloudIdentityService(credentialsReader)
+		groupNames := mapGroupNames(cloudIdentityService, groups)
+		p.groupValidator = func(s *sessions.SessionState) bool {
+			// Reset our saved Groups in case membership changed
+			// This is used by `Authorize` on every request
+			s.Groups = make([]string, 0, len(groups))
+			for _, group := range groups {
+				if n, exists := groupNames[group]; exists {
+					if userInGroup2(cloudIdentityService, n, s.Email) {
+						s.Groups = append(s.Groups, group)
+					}
+				}
+			}
+			return len(s.Groups) > 0
+		}
+		return
+	}
+
 	adminService := getAdminService(adminEmail, credentialsReader)
 	p.groupValidator = func(s *sessions.SessionState) bool {
 		// Reset our saved Groups in case membership changed
@@ -263,6 +283,46 @@ func userInGroup(service *admin.Service, group string, email string) bool {
 		logger.Errorf("error checking group membership: %v", err)
 	}
 	return false
+}
+
+func getCloudIdentityService(credentialsReader io.Reader) *cloudidentity.Service {
+	data, err := ioutil.ReadAll(credentialsReader)
+	if err != nil {
+		logger.Fatal("can't read Google credentials file:", err)
+	}
+	conf, err := google.JWTConfigFromJSON(data, cloudidentity.CloudIdentityGroupsReadonlyScope)
+	if err != nil {
+		logger.Fatal("can't load Google credentials file:", err)
+	}
+
+	ctx := context.Background()
+	client := conf.Client(ctx)
+	cloudIdentityService, err := cloudidentity.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		logger.Fatal(err)
+	}
+	return cloudIdentityService
+}
+
+func mapGroupNames(service *cloudidentity.Service, groups []string) map[string]string {
+	groupNames := make(map[string]string)
+	for _, group := range groups {
+		r, err := service.Groups.Lookup().GroupKeyId(group).Do()
+		if err != nil {
+			logger.Fatal("fail to lookup group:", err)
+		}
+		groupNames[group] = r.Name
+	}
+	return groupNames
+}
+
+func userInGroup2(service *cloudidentity.Service, groupName string, email string) bool {
+	_, err := service.Groups.Memberships.Lookup(groupName).MemberKeyId(email).Do()
+	if err != nil {
+		logger.Errorf("error checking group membership: %v\n", err)
+		return false
+	}
+	return true
 }
 
 // RefreshSession uses the RefreshToken to fetch new Access and ID Tokens
